@@ -1,0 +1,2 @@
+C依赖：libserialport
+Rust依赖：ratatui
