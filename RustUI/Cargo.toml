@@ -1,0 +1,5 @@
+[package]
+name = "RustUI"
+version = "0.1.0"
+edition = "2021"
+description = "Rust UI for SakuraCom serial tool"
