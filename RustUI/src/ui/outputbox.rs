@@ -76,8 +76,9 @@ impl OutputBox {
     }
 
     /// 从共享缓冲区同步行数据到自有缓冲区（渲染前调用）
+    /// 新数据到达时自动滚动到最底部
     pub fn sync_from_shared(&mut self) {
-        if let Some(ref shared) = self.shared_lines {
+        let has_new_data = if let Some(ref shared) = self.shared_lines {
             if let Ok(mut shared_lines) = shared.lock() {
                 if !shared_lines.is_empty() {
                     self.own_lines.append(&mut shared_lines);
@@ -85,7 +86,27 @@ impl OutputBox {
                     while self.own_lines.len() > self.max_lines {
                         self.own_lines.remove(0);
                     }
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if has_new_data {
+            self.scroll_to_bottom();
+        }
+    }
+
+    /// 清空共享缓冲区（HEX 模式下不追加到 own_lines，仅消耗共享数据防止泄漏）
+    pub fn drain_shared(&mut self) {
+        if let Some(ref shared) = self.shared_lines {
+            if let Ok(mut shared_lines) = shared.lock() {
+                shared_lines.clear();
             }
         }
     }
@@ -93,9 +114,11 @@ impl OutputBox {
     /// 追加一行输出
     pub fn append_line(&mut self, text: &str) {
         self.own_lines.push(text.to_string());
-        if self.own_lines.len() > self.max_lines {
+        while self.own_lines.len() > self.max_lines {
             self.own_lines.remove(0);
         }
+        // 追加时也自动滚动到底部
+        self.scroll_to_bottom();
     }
 
     /// 追加原始字节数据（根据当前模式自动格式化）
@@ -170,6 +193,37 @@ impl OutputBox {
         self.mode
     }
 
+    /// 从原始字节数据重建行显示（上层封装：模式切换时调用）
+    /// 先清空 own_lines，再根据当前 self.mode 将 raw_bytes 转为行并压入
+    pub fn rebuild_from_raw(&mut self, raw_bytes: &[u8]) {
+        self.own_lines.clear();
+        self.scroll_offset = 0;
+
+        if raw_bytes.is_empty() {
+            return;
+        }
+
+        match self.mode {
+            OutputMode::Ascii => {
+                // ASCII 模式：将原始字节按 UTF-8 解析为字符串，非 UTF-8 部分用 HEX 表示
+                let text = String::from_utf8_lossy(raw_bytes);
+                // 按行分割
+                for line in text.lines() {
+                    self.own_lines.push(line.to_string());
+                }
+            }
+            OutputMode::Hex => {
+                // HEX 模式：所有字节按顺序排列，不带 ASCII 预览，不考虑换行
+                let hex_str: String = raw_bytes
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.own_lines.push(hex_str);
+            }
+        }
+    }
+
     /// 对文本进行自动换行，返回每个显示行的内容
     fn wrap_text(&self, text: &str, max_width: u16) -> Vec<String> {
         if max_width == 0 {
@@ -214,6 +268,20 @@ impl OutputBox {
     /// 获取可见行数（不包括边框）
     fn visible_rows(&self, area_height: u16) -> usize {
         area_height.saturating_sub(2) as usize
+    }
+
+    /// 滚动到最底部（新数据到达时调用）
+    fn scroll_to_bottom(&mut self) {
+        let area = self.base.area;
+        let inner_width = area.width.saturating_sub(4).max(1);
+        let visible_rows = self.visible_rows(area.height);
+        let mut total_phys = 0usize;
+        for line in &self.own_lines {
+            let wrapped = self.wrap_text(line, inner_width);
+            total_phys += wrapped.len();
+        }
+        let max_offset = total_phys.saturating_sub(visible_rows);
+        self.scroll_offset = max_offset;
     }
 
     /// 限制滚动偏移在有效范围内

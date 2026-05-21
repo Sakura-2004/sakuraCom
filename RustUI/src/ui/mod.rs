@@ -30,7 +30,7 @@ pub use button::Button;
 pub use checkbar::Checkbar;
 pub use component::Component;
 pub use dropdown::Dropdown;
-pub use inputbox::InputBox;
+pub use inputbox::{hex_str_to_bytes, InputBox};
 pub use outputbox::{OutputBox, OutputMode};
 pub use radiobox::RadioBox;
 pub use ui_manage::Scheduler;
@@ -46,6 +46,17 @@ pub static INPUT_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// 输出显示模式: 0=ASCII, 1=HEX
 pub static OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// 上一次的输出模式值（用于检测变化，触发 rebuild_from_raw）
+pub static PREV_OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// 检测并处理输出模式切换
+/// 返回 true 表示发生了切换，调用方应执行 rebuild
+pub fn check_output_mode_switch() -> bool {
+    let current = OUTPUT_MODE.load(Ordering::Relaxed);
+    let prev = PREV_OUTPUT_MODE.swap(current, Ordering::Relaxed);
+    prev != current
+}
 
 /// 设置退出标志
 pub fn request_quit() {
@@ -72,13 +83,13 @@ pub fn run_app<B: Backend>(
             }
 
             let ev = event::read()?;
-
+            /*
             if let Event::Key(key) = &ev {
                 if key.code == crossterm::event::KeyCode::Char('q') {
                     return Ok(());
                 }
             }
-
+            */
             scheduler.handle_event(&ev);
         }
 
@@ -262,8 +273,8 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
             let input_row = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Ratio(2, 3),  // 输入框占 2/3
-                    Constraint::Ratio(1, 3),  // 模式选择占 1/3
+                    Constraint::Ratio(3, 4),  // 输入框占 2/3
+                    Constraint::Ratio(1, 4),  // 模式选择占 1/3
                 ])
                 .split(chunks[4]);
 
@@ -276,8 +287,8 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
             let output_row = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Ratio(2, 3),  // 输出框占 2/3
-                    Constraint::Ratio(1, 3),  // 模式选择占 1/3
+                    Constraint::Ratio(3, 4),  // 输出框占 2/3
+                    Constraint::Ratio(1, 4),  // 模式选择占 1/3
                 ])
                 .split(chunks[5]);
 
@@ -311,13 +322,48 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
             if crate::pipe::take_clear_request() {
                 output_box.clear();
             }
-            output_box.sync_from_shared();
-            // 同步输出模式
+            // 同步输出模式（必须在 sync_from_shared 之前设置，HEX 模式下跳过文本追加）
             let mode = match OUTPUT_MODE.load(Ordering::Relaxed) {
                 0 => OutputMode::Ascii,
                 _ => OutputMode::Hex,
             };
             output_box.set_mode(mode);
+
+            // 检测输出模式是否切换
+            let mode_switched = check_output_mode_switch();
+
+            if mode == OutputMode::Hex {
+                // HEX 模式：基于原始字节缓冲区重建显示（每次渲染都重建，实时反映新数据）
+                let raw_snapshot = crate::pipe::get_raw_output_snapshot();
+                output_box.rebuild_from_raw(&raw_snapshot);
+                // 仍需消耗共享缓冲区，避免内存泄漏（但不使用其结果）
+                output_box.drain_shared();
+            } else {
+                // ASCII 模式：追加共享行缓冲区中的文本行
+                output_box.sync_from_shared();
+                // 如果刚从 HEX 切回 ASCII，也需要重建
+                if mode_switched {
+                    let raw_snapshot = crate::pipe::get_raw_output_snapshot();
+                    output_box.rebuild_from_raw(&raw_snapshot);
+                }
+            }
+        }
+    }
+
+    // ── 每帧检查 InputBox 错误消息是否过期 (索引7: InputBox) ──
+    if total >= 8 {
+        if let Some(input_box) = comps[7].as_any_mut().downcast_mut::<InputBox>() {
+            input_box.take_error_message();
+        }
+    }
+
+    // ── 更新统计信息 (索引5: stats OutputBox) ──
+    if total >= 6 {
+        if let Some(stats_box) = comps[5].as_any_mut().downcast_mut::<OutputBox>() {
+            let sent = crate::pipe::sent_bytes();
+            let recv = crate::pipe::received_bytes();
+            stats_box.clear();
+            stats_box.append_line(&format!("发送: {} bytes  |  接收: {} bytes", sent, recv));
         }
     }
 

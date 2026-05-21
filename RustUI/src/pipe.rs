@@ -4,7 +4,7 @@
 /// 发送：其他模块通过 send_text() 直接向 C 端写入数据
 /// 接收：子线程从管道读取数据，直接写入 OutputBox 的共享缓冲区
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -17,6 +17,12 @@ static READ_PIPE: OnceLock<Mutex<RawFd>> = OnceLock::new();
 /// reader 线程是否已启动
 static READER_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// 已发送字节计数
+static SENT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 已接收字节计数
+static RECEIVED_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// 清空请求标志（clear 按钮设置，mod.rs ui() 检查并清空 own_lines）
 static CLEAR_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -25,6 +31,41 @@ static INPUT_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 
 /// 输出框的共享行缓冲区（clear 按钮回调时清空）
 static OUTPUT_LINES: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+
+/// 原始输出字节缓冲区（上层封装：模式切换时用于重建行数据显示）
+static RAW_OUTPUT_BUFFER: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+
+/// 初始化原始输出字节缓冲区（上层封装，main.rs 调用）
+pub fn init_raw_output_buffer() -> Arc<Mutex<Vec<u8>>> {
+    let raw = Arc::new(Mutex::new(Vec::<u8>::new()));
+    RAW_OUTPUT_BUFFER
+        .set(raw.clone())
+        .expect("RAW_OUTPUT_BUFFER already initialized");
+    raw
+}
+
+/// 获取当前原始输出字节缓冲区的快照（上层封装，模式切换时调用）
+pub fn get_raw_output_snapshot() -> Vec<u8> {
+    if let Some(raw) = RAW_OUTPUT_BUFFER.get() {
+        if let Ok(buf) = raw.lock() {
+            return buf.clone();
+        }
+    }
+    Vec::new()
+}
+
+/// 向发送管道写入原始字节数据（上层封装）
+pub fn send_bytes(data: &[u8]) {
+    SENT_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+    if let Some(pipe) = SEND_PIPE.get() {
+        if let Ok(fd) = pipe.lock() {
+            let write_fd = *fd;
+            let _ = unsafe {
+                libc::write(write_fd, data.as_ptr() as *const libc::c_void, data.len())
+            };
+        }
+    }
+}
 
 /// 初始化发送管道
 pub fn init_send(fd: RawFd) {
@@ -77,6 +118,7 @@ pub fn init_receive(read_fd: RawFd, output_lines: Arc<Mutex<Vec<String>>>) {
                 }
 
                 let n = n as usize;
+                RECEIVED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 let text = match std::str::from_utf8(&buf[..n]) {
                     Ok(s) => s.to_string(),
                     Err(_) => {
@@ -89,10 +131,16 @@ pub fn init_receive(read_fd: RawFd, output_lines: Arc<Mutex<Vec<String>>>) {
                     }
                 };
 
-                // 按行直接推入 OutputBox 的共享缓冲区
+                // 按行直接推入 OutputBox 的共享行缓冲区
                 if let Ok(mut lines) = output_lines.lock() {
                     for line in text.lines() {
                         lines.push(line.to_string());
+                    }
+                }
+                // 同时写入原始字节缓冲区（上层封装，模式切换时重建显示用）
+                if let Some(raw_buf) = RAW_OUTPUT_BUFFER.get() {
+                    if let Ok(mut raw) = raw_buf.lock() {
+                        raw.extend_from_slice(&buf[..n]);
                     }
                 }
             }
@@ -103,6 +151,7 @@ pub fn init_receive(read_fd: RawFd, output_lines: Arc<Mutex<Vec<String>>>) {
 /// 向发送管道写入数据（由按钮回调直接调用）
 /// 注意：不再自动追加 '\n'，由调用方决定换行时机
 pub fn send_text(text: &str) {
+    SENT_BYTES.fetch_add(text.len() as u64, Ordering::Relaxed);
     if let Some(pipe) = SEND_PIPE.get() {
         if let Ok(fd) = pipe.lock() {
             let data = text.as_bytes();
@@ -141,12 +190,18 @@ pub fn get_input_text() -> String {
 }
 
 /// 清空输出缓冲区（清空按钮回调直接调用）
-/// 清空共享缓冲区，并设置清空请求标志，
+/// 清空共享行缓冲区和原始字节缓冲区，并设置清空请求标志，
 /// mod.rs 的 ui() 渲染前会检查该标志并同步清空 OutputBox 的 own_lines
 pub fn clear_output() {
-    // 清空共享缓冲区
+    // 清空共享行缓冲区
     if let Some(lines) = OUTPUT_LINES.get() {
         if let Ok(mut buf) = lines.lock() {
+            buf.clear();
+        }
+    }
+    // 清空原始字节缓冲区
+    if let Some(raw) = RAW_OUTPUT_BUFFER.get() {
+        if let Ok(mut buf) = raw.lock() {
             buf.clear();
         }
     }
@@ -162,4 +217,20 @@ pub fn take_clear_request() -> bool {
 /// 获取发送管道 fd 的原始值（主要用于关闭）
 pub fn send_fd() -> Option<RawFd> {
     SEND_PIPE.get().and_then(|m| m.lock().ok()).map(|fd| *fd)
+}
+
+/// 获取已发送字节数
+pub fn sent_bytes() -> u64 {
+    SENT_BYTES.load(Ordering::Relaxed)
+}
+
+/// 获取已接收字节数
+pub fn received_bytes() -> u64 {
+    RECEIVED_BYTES.load(Ordering::Relaxed)
+}
+
+/// 重置统计数据
+pub fn reset_stats() {
+    SENT_BYTES.store(0, Ordering::Relaxed);
+    RECEIVED_BYTES.store(0, Ordering::Relaxed);
 }

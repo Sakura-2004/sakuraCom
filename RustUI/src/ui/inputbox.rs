@@ -8,6 +8,34 @@ use ratatui::{
 
 use super::component::{BaseComponent, Component};
 use std::any::Any;
+use std::time::Instant;
+
+/// 将 hex 字符串按每 2 个字符解析为一个字节（不理空格/换行等非 hex 字符）
+/// 奇数位时最后一个字符单独解析为低 4 位
+pub fn hex_str_to_bytes(text: &str) -> Vec<u8> {
+    let hex_chars: Vec<char> = text
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < hex_chars.len() {
+        // 如果还剩 2 个字符，解析为一个完整字节
+        if i + 1 < hex_chars.len() {
+            let hi = hex_chars[i].to_digit(16).unwrap() as u8;
+            let lo = hex_chars[i + 1].to_digit(16).unwrap() as u8;
+            bytes.push(hi << 4 | lo);
+            i += 2;
+        } else {
+            // 奇数个字符，最后一个单独解析为低 4 位
+            let lo = hex_chars[i].to_digit(16).unwrap() as u8;
+            bytes.push(lo);
+            i += 1;
+        }
+    }
+    bytes
+}
 
 /// 输入框组件（支持多行输入，Enter 插入换行，HEX 模式校验）
 pub struct InputBox {
@@ -21,8 +49,8 @@ pub struct InputBox {
     on_input_cb: Option<Box<dyn FnMut(&str)>>,
     /// 错误提示信息（非法的 HEX 字符等）
     error_message: Option<String>,
-    /// 错误消息定时器（帧数）
-    error_timer: u32,
+    /// 错误消息消失时刻（1s 后清除，None 表示无错误）
+    error_timer: Option<Instant>,
     /// 滚动偏移（物理行级别）
     scroll_offset: usize,
 }
@@ -38,7 +66,7 @@ impl InputBox {
             cursor_pos: 0,
             on_input_cb: None,
             error_message: None,
-            error_timer: 0,
+            error_timer: None,
             scroll_offset: 0,
         }
     }
@@ -51,6 +79,24 @@ impl InputBox {
     /// 获取当前输入的内容
     pub fn content(&self) -> &str {
         &self.content
+    }
+
+    /// 将输入文本按指定模式转换为待发送的字节数据
+    /// mode: 0=ASCII（直接取每个字符的字节值），1=HEX（解析十六进制字符串）
+    pub fn to_send_bytes(&self, mode: u8) -> Vec<u8> {
+        let text = self.content.trim();
+
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        if mode == 1 {
+            // HEX 模式：每 2 个 hex 字符解析一个字节，不要求空格分隔
+            hex_str_to_bytes(text)
+        } else {
+            // ASCII 模式：直接取每个字符的 UTF-8 字节
+            text.as_bytes().to_vec()
+        }
     }
 
     /// 设置内容
@@ -86,7 +132,7 @@ impl InputBox {
                 self.fire_input();
             } else if !c.is_ascii_whitespace() {
                 self.error_message = Some(format!("非法 HEX 字符: '{}'，仅允许 0-9, a-f, A-F", c));
-                self.error_timer = 30;
+                self.error_timer = Some(Instant::now());
             }
         } else {
             // ASCII 模式：接受所有字符
@@ -127,13 +173,17 @@ impl InputBox {
         }
     }
 
-    /// 获取错误消息（自动降帧清除）
+    /// 获取错误消息（基于真实时间的 1 秒计时器，过期自动清除）
     pub fn take_error_message(&mut self) -> Option<String> {
-        if self.error_timer > 0 {
-            self.error_timer -= 1;
-            self.error_message.clone()
+        if let Some(expire_time) = self.error_timer {
+            if expire_time.elapsed() >= std::time::Duration::from_secs(1) {
+                self.error_message = None;
+                self.error_timer = None;
+                None
+            } else {
+                self.error_message.clone()
+            }
         } else {
-            self.error_message = None;
             None
         }
     }
@@ -281,7 +331,7 @@ impl Component for InputBox {
             Vec::new()
         };
 
-        let block_style = if self.error_timer > 0 {
+        let block_style = if self.error_timer.is_some() {
             Style::default().fg(Color::Red)
         } else {
             style

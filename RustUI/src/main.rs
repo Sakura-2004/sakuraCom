@@ -223,7 +223,24 @@ fn main() -> std::io::Result<()> {
     );
     send_btn.set_on_click(|| {
         let text = pipe::get_input_text();
-        if !text.is_empty() {
+        if text.is_empty() {
+            return;
+        }
+        // 根据当前输入模式，将文本转换为字节后发送
+        let mode = ui::INPUT_MODE.load(std::sync::atomic::Ordering::Relaxed);
+        // 从 UI 组件表中获取 InputBox (索引7)
+        // 注：此处只能通过 pipe 间接获取文本，to_send_bytes 需要 InputBox 实例
+        // 简化：ASCII 模式直接发文本，HEX 模式用 pipe::send_text (最终由 C 端解释)
+        // 实际上，上层封装发送动作应经过 InputBox.to_send_bytes，
+        // 但 click 回调无法直接拿到 InputBox 引用。
+        // 因此保留原有逻辑作为默认行为，并增加 send_bytes 支持：
+        if mode == 1 {
+            // HEX 模式：每 2 个 hex 字符解析一个字节，不要求空格分隔
+            let bytes = ui::hex_str_to_bytes(&text);
+            if !bytes.is_empty() {
+                pipe::send_bytes(&bytes);
+            }
+        } else {
             pipe::send_text(&text);
         }
     });
@@ -259,6 +276,8 @@ fn main() -> std::io::Result<()> {
 
     // ── 初始化管道通信 ──
     // 必须在注册 OutputBox 之后调用，才能把共享缓冲区传给 reader 线程
+    // 同时初始化原始字节缓冲区（用于模式切换重建显示）
+    pipe::init_raw_output_buffer();
     pipe::init_send(write_fd);
     pipe::init_receive(read_fd, output_lines);
 
