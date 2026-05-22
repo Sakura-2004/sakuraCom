@@ -51,6 +51,10 @@ pub trait Component: Any {
         false
     }
 
+    /// 渲染前同步内部状态（如从共享缓冲区拉取数据）
+    /// Scheduler 在 render_all 前对每个组件调用一次
+    fn sync(&mut self) {}
+
     /// 向下转型到 Any，支持按具体类型访问
     fn as_any(&self) -> &dyn Any;
 

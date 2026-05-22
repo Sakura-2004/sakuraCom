@@ -218,7 +218,7 @@ impl Component for RadioBox {
     }
 
     fn focusable(&self) -> bool {
-        true
+        !self.locked
     }
 
     fn set_focused(&mut self, focused: bool) {

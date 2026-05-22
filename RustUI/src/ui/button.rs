@@ -17,6 +17,8 @@ pub struct Button {
     label: String,
     /// 点击回调函数
     on_click_cb: Option<Box<dyn FnMut()>>,
+    /// 是否禁用（禁用后不可交互、不可聚焦）
+    disabled: bool,
 }
 
 impl Button {
@@ -40,6 +42,7 @@ impl Button {
             base,
             label: label.to_string(),
             on_click_cb: None,
+            disabled: false,
         }
     }
 
@@ -72,6 +75,19 @@ impl Button {
     /// 设置焦点样式
     pub fn set_focus_style(&mut self, style: Style) {
         self.base.set_focus_style(style);
+    }
+
+    /// 设置禁用状态
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+        if disabled {
+            self.base.has_focus = false;
+        }
+    }
+
+    /// 是否被禁用
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
     }
 }
 
@@ -110,6 +126,9 @@ impl Component for Button {
     }
 
     fn on_click(&mut self) -> bool {
+        if self.disabled {
+            return false;
+        }
         if let Some(ref mut cb) = self.on_click_cb {
             cb();
             true
@@ -119,6 +138,9 @@ impl Component for Button {
     }
 
     fn on_key(&mut self, key: KeyCode) -> bool {
+        if self.disabled {
+            return false;
+        }
         match key {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // 回车或空格触发按钮点击
@@ -129,7 +151,7 @@ impl Component for Button {
     }
 
     fn focusable(&self) -> bool {
-        true
+        !self.disabled
     }
 
     fn set_focused(&mut self, focused: bool) {

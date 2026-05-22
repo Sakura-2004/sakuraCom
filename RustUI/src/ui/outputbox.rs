@@ -3,7 +3,6 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Style},
-    text::Span,
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
@@ -225,21 +224,83 @@ impl OutputBox {
     }
 
     /// 对文本进行自动换行，返回每个显示行的内容
+    /// 以单词/词素为边界换行，避免在单词中间截断
     fn wrap_text(&self, text: &str, max_width: u16) -> Vec<String> {
         if max_width == 0 {
             return vec![text.to_string()];
         }
         let max_w = max_width as usize;
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();
+
+        // 将文本拆分为 token：空白、CJK 字符、连续 ASCII 字母数字各为一个 token
+        let mut tokens: Vec<(String, usize)> = Vec::new();
+        let mut token = String::new();
+        let mut in_cjk = false;
+        let mut in_space = false;
+        let mut in_alnum = false;
+
         for ch in text.chars() {
-            let ch_width = if ch.is_ascii() || (ch as u32) < 0x2E80 { 1 } else { 2 };
-            let cur_len = self.str_width(&current);
-            if cur_len + ch_width > max_w {
-                lines.push(std::mem::take(&mut current));
+            let ch_is_space = ch.is_whitespace();
+            let ch_is_cjk = !ch.is_ascii() && (ch as u32) >= 0x2E80;
+            let ch_is_alnum = ch.is_ascii_alphanumeric();
+
+            if token.is_empty() {
+                in_cjk = ch_is_cjk;
+                in_space = ch_is_space;
+                in_alnum = ch_is_alnum;
+            } else {
+                let flush = ch_is_space != in_space
+                    || ch_is_cjk
+                    || ch_is_cjk != in_cjk
+                    || (in_alnum && !ch_is_alnum)
+                    || (!in_alnum && ch_is_alnum);
+                if flush {
+                    let w = self.str_width(&token);
+                    tokens.push((std::mem::take(&mut token), w));
+                    in_cjk = ch_is_cjk;
+                    in_space = ch_is_space;
+                    in_alnum = ch_is_alnum;
+                }
             }
-            current.push(ch);
+            token.push(ch);
+
+            // CJK 字符每个独立为一个 token
+            if ch_is_cjk {
+                let w = if (ch as u32) < 0x2E80 { 1 } else { 2 };
+                tokens.push((std::mem::take(&mut token), w));
+                in_cjk = false;
+                in_space = false;
+                in_alnum = false;
+            }
         }
+        if !token.is_empty() {
+            let w = self.str_width(&token);
+            tokens.push((token, w));
+        }
+
+        // 逐 token 放入当前行
+        for (tok, tok_width) in tokens {
+            let cur_len = self.str_width(&current);
+
+            // 当前行为空时，强制放入（允许超长 token 完整显示）
+            if current.is_empty() {
+                current.push_str(&tok);
+                continue;
+            }
+
+            if cur_len + tok_width > max_w {
+                lines.push(std::mem::take(&mut current));
+                // 跳过行首的纯空白 token
+                if tok.trim().is_empty() {
+                    continue;
+                }
+                current.push_str(&tok);
+            } else {
+                current.push_str(&tok);
+            }
+        }
+
         if !current.is_empty() {
             lines.push(current);
         }
@@ -271,9 +332,9 @@ impl OutputBox {
     }
 
     /// 滚动到最底部（新数据到达时调用）
-    fn scroll_to_bottom(&mut self) {
+    pub fn scroll_to_bottom(&mut self) {
         let area = self.base.area;
-        let inner_width = area.width.saturating_sub(4).max(1);
+        let inner_width = area.width.saturating_sub(2).max(1); // borders(2), 滚动条与文字重叠不复用列
         let visible_rows = self.visible_rows(area.height);
         let mut total_phys = 0usize;
         for line in &self.own_lines {
@@ -333,11 +394,17 @@ impl OutputBox {
 }
 
 impl Component for OutputBox {
+    fn sync(&mut self) {
+        // 同步逻辑已移至 mod.rs ui() 中统一处理
+        // （通过 rebuild_from_raw + scroll_to_bottom + drain_shared）
+        // 此处仅消耗共享缓冲区，防止内存泄漏
+        self.drain_shared();
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let style = self.base.current_style();
 
-        let inner_width = area.width.saturating_sub(4); // borders(2) + scrollbar(1) + padding
-        let inner_width = inner_width.max(1);
+        let inner_width = area.width.saturating_sub(2).max(1); // borders(2), 滚动条与文字重叠不复用列
         let visible_rows = area.height.saturating_sub(2) as usize;
 
         // 对所有原始行进行自动换行，得到物理行列表
@@ -405,7 +472,7 @@ impl Component for OutputBox {
     }
 
     fn on_key(&mut self, key: KeyCode) -> bool {
-        let inner_width = self.base.area.width.saturating_sub(4).max(1);
+        let inner_width = self.base.area.width.saturating_sub(2).max(1);
         let visible_rows = self.base.area.height.saturating_sub(2) as usize;
 
         // 计算总物理行数
@@ -457,7 +524,7 @@ impl Component for OutputBox {
     }
 
     fn on_scroll(&mut self, up: bool) -> bool {
-        let inner_width = self.base.area.width.saturating_sub(4).max(1);
+        let inner_width = self.base.area.width.saturating_sub(2).max(1);
         let visible_rows = self.base.area.height.saturating_sub(2) as usize;
         let mut total_phys = 0usize;
         for line in &self.own_lines {

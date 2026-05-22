@@ -2,7 +2,7 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -Wextra -I./Ccom/inc $(shell pkg-config --cflags libserialport)
-LDFLAGS = $(shell pkg-config --libs libserialport)
+LDFLAGS = $(shell pkg-config --libs libserialport) -lpthread
 
 # Directories
 SRC_DIR = Ccom/src

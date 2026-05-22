@@ -8,13 +8,16 @@ use ratatui::{
 
 use super::component::{BaseComponent, Component};
 use std::any::Any;
+use std::sync::{Arc, Mutex};
 
 /// 下拉选择菜单组件（水平导航模式，单行显示，不展开）
 pub struct Dropdown {
     /// 基础组件
     base: BaseComponent,
-    /// 选项列表（变长数组）
+    /// 选项列表（变长数组，对于普通 dropdown 是自有数据）
     options: Vec<String>,
+    /// 共享选项列表（串口选择 dropdown 使用，由协议层 0x02/0x03 更新）
+    shared_options: Option<Arc<Mutex<Vec<String>>>>,
     /// 当前选中项的索引
     selected_index: usize,
     /// 是否锁定（锁定后不可修改选择）
@@ -38,10 +41,58 @@ impl Dropdown {
         Self {
             base,
             options: options.iter().map(|s| s.to_string()).collect(),
+            shared_options: None,
             selected_index: 0,
             locked: false,
             on_select_cb: None,
             title: title.to_string(),
+        }
+    }
+
+    /// 使用共享列表创建 dropdown（用于串口选择等动态列表）
+    pub fn new_with_shared(shared: Arc<Mutex<Vec<String>>>, title: &str) -> Self {
+        let initial = {
+            let list = shared.lock().unwrap();
+            list.clone()
+        };
+        let label = if initial.is_empty() {
+            "(empty)".to_string()
+        } else {
+            format!("▸ [1/{}] {}", initial.len(), initial[0])
+        };
+        let base = BaseComponent::new(&label);
+
+        Self {
+            base,
+            options: initial,
+            shared_options: Some(shared),
+            selected_index: 0,
+            locked: false,
+            on_select_cb: None,
+            title: title.to_string(),
+        }
+    }
+
+    /// 从共享列表同步选项（每次渲染前调用）
+    fn sync_from_shared(&mut self) {
+        let was_empty = self.options.is_empty();
+        let new_options = {
+            self.shared_options
+                .as_ref()
+                .and_then(|shared| shared.lock().ok())
+                .map(|list| list.clone())
+        };
+        if let Some(list) = new_options {
+            self.options = list;
+            if self.selected_index >= self.options.len() && !self.options.is_empty() {
+                self.selected_index = 0;
+            }
+            self.update_label();
+            // 首次收到端口列表时触发 on_select，
+            // 确保 SELECTED_PORT_NAME 等全局缓存被初始化
+            if was_empty && !self.options.is_empty() {
+                self.fire_select();
+            }
         }
     }
 
@@ -212,7 +263,18 @@ impl Dropdown {
     }
 }
 
+impl Dropdown {
+    /// 公开的同步入口（Scheduler::sync_components 调用）
+    pub fn sync(&mut self) {
+        self.sync_from_shared();
+    }
+}
+
 impl Component for Dropdown {
+    fn sync(&mut self) {
+        self.sync_from_shared();
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let style = self.base.current_style();
 
@@ -270,7 +332,7 @@ impl Component for Dropdown {
     }
 
     fn focusable(&self) -> bool {
-        true
+        !self.locked
     }
 
     fn set_focused(&mut self, focused: bool) {

@@ -35,9 +35,10 @@ impl Scheduler {
     }
 
     /// 渲染所有组件
-    pub fn render_all(&self, f: &mut Frame) {
+    pub fn render_all(&mut self, f: &mut Frame) {
         let buf = f.buffer_mut();
-        for comp in &self.components {
+        for comp in &mut self.components {
+            comp.sync();
             comp.render(comp.area(), buf);
         }
     }

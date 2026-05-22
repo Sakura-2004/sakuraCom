@@ -50,12 +50,24 @@ pub static OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
 /// 上一次的输出模式值（用于检测变化，触发 rebuild_from_raw）
 pub static PREV_OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
 
+/// 上一次原始字节缓冲区长度（用于检测新数据到达）
+pub static PREV_RAW_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// 检测并处理输出模式切换
 /// 返回 true 表示发生了切换，调用方应执行 rebuild
 pub fn check_output_mode_switch() -> bool {
     let current = OUTPUT_MODE.load(Ordering::Relaxed);
     let prev = PREV_OUTPUT_MODE.swap(current, Ordering::Relaxed);
     prev != current
+}
+
+/// 检测原始字节缓冲区是否有新数据（比较当前长度与上次记录长度）
+/// 返回 (has_new, current_len)
+pub fn detect_new_raw_data() -> (bool, usize) {
+    let raw = crate::pipe::get_raw_output_snapshot();
+    let current_len = raw.len();
+    let prev = PREV_RAW_LEN.swap(current_len, std::sync::atomic::Ordering::Relaxed);
+    (current_len != prev, current_len)
 }
 
 /// 设置退出标志
@@ -200,39 +212,42 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
 
     // 组件注册顺序：
     //   0: Dropdown (串口选择)       → chunks[1]
-    //   1: Dropdown (波特率)         → chunks[2] 左
-    //   2: Dropdown (校验位)         → chunks[2] 中
-    //   3: Dropdown (停止位)         → chunks[2] 右
-    //   4: Button   (打开串口)       → chunks[3] 左
-    //   5: OutputBox (统计)          → chunks[3] 中
-    //   6: RadioBox (输入模式)       → chunks[4] 右
-    //   7: InputBox (输入栏)         → chunks[4] 左
-    //   8: OutputBox (输出栏)        → chunks[5] 左
-    //   9: RadioBox (输出模式)       → chunks[5] 右
-    //  10: Button   (发送)           → chunks[6] 左
-    //  11: Button   (清空)           → chunks[6] 中
-    //  12: Button   (退出)           → chunks[6] 右
+    //   1: Dropdown (波特率)         → chunks[2] 左1
+    //   2: Dropdown (数据位)         → chunks[2] 左2
+    //   3: Dropdown (校验位)         → chunks[2] 右2
+    //   4: Dropdown (停止位)         → chunks[2] 右1
+    //   5: Button   (打开串口)       → chunks[3] 左
+    //   6: OutputBox (统计)          → chunks[3] 中
+    //   7: RadioBox (输入模式)       → chunks[4] 右
+    //   8: InputBox (输入栏)         → chunks[4] 左
+    //   9: OutputBox (输出栏)        → chunks[5] 左
+    //  10: RadioBox (输出模式)       → chunks[5] 右
+    //  11: Button   (发送)           → chunks[6] 左
+    //  12: Button   (清空)           → chunks[6] 中
+    //  13: Button   (退出)           → chunks[6] 右
 
-    if total >= 4 {
+    if total >= 5 {
         // ── [1] 串口选择 ──
         comps[0].set_area(chunks[1]);
 
-        // ── [2] 波特率 / 校验位 / 停止位 ──
+        // ── [2] 波特率 / 数据位 / 校验位 / 停止位 ──
         let param_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
             ])
             .split(chunks[2]);
 
         comps[1].set_area(param_chunks[0]); // 波特率
-        comps[2].set_area(param_chunks[1]); // 校验位
-        comps[3].set_area(param_chunks[2]); // 停止位
+        comps[2].set_area(param_chunks[1]); // 数据位
+        comps[3].set_area(param_chunks[2]); // 校验位
+        comps[4].set_area(param_chunks[3]); // 停止位
 
         // ── [3] 打开串口按钮 + 统计输出 + 状态指示 ──
-        if total >= 6 {
+        if total >= 7 {
             let bottom_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -242,8 +257,8 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
                 ])
                 .split(chunks[3]);
 
-            comps[4].set_area(bottom_chunks[0]); // 打开串口按钮
-            comps[5].set_area(bottom_chunks[1]); // 统计输出栏
+            comps[5].set_area(bottom_chunks[0]); // 打开串口按钮
+            comps[6].set_area(bottom_chunks[1]); // 统计输出栏
 
             // ── [3-右] 状态指示器 (直接绘制，非组件) ──
             let connected = CONNECTION_STATUS.load(Ordering::Relaxed) != 0;
@@ -266,10 +281,53 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
             .block(indicator_block)
             .alignment(Alignment::Center);
             f.render_widget(indicator_paragraph, bottom_chunks[2]);
+
+            // ── 根据连接状态更新按钮标签、样式和锁定模式 ──
+            if let Some(btn) = comps[5].as_any_mut().downcast_mut::<Button>() {
+                if connected {
+                    btn.set_label("断开连接");
+                    btn.set_style(Style::default().fg(Color::White).bg(Color::Red));
+                    btn.set_focus_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                } else {
+                    btn.set_label("打开串口");
+                    btn.set_style(Style::default().fg(Color::White).bg(Color::Green));
+                    btn.set_focus_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+
+            // ── 锁定模式：已连接时锁定串口配置 dropdown (索引 0-4)，未连接时禁用发送/清空按钮 ──
+            // 串口选择 (0)、波特率 (1)、数据位 (2)、校验位 (3)、停止位 (4)
+            for i in 0..5usize {
+                if let Some(dropdown) = comps[i].as_any_mut().downcast_mut::<Dropdown>() {
+                    if connected {
+                        dropdown.lock();
+                    } else {
+                        dropdown.unlock();
+                    }
+                }
+            }
+            // 发送按钮 (11)、清空按钮 (12)
+            if total >= 13 {
+                for i in 11..13usize {
+                    if let Some(btn) = comps[i].as_any_mut().downcast_mut::<Button>() {
+                        btn.set_disabled(!connected);
+                    }
+                }
+            }
         }
 
         // ── [4] 输入栏（左 2/3）+ 输入模式选择（右 1/3） ──
-        if total >= 8 {
+        if total >= 9 {
             let input_row = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -278,12 +336,12 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
                 ])
                 .split(chunks[4]);
 
-            comps[7].set_area(input_row[0]);  // InputBox
-            comps[6].set_area(input_row[1]);  // RadioBox（输入模式）
+            comps[8].set_area(input_row[0]);  // InputBox
+            comps[7].set_area(input_row[1]);  // RadioBox（输入模式）
         }
 
         // ── [5] 输出栏（左 2/3）+ 输出模式选择（右 1/3） ──
-        if total >= 10 {
+        if total >= 11 {
             let output_row = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -292,14 +350,14 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
                 ])
                 .split(chunks[5]);
 
-            comps[8].set_area(output_row[0]);  // OutputBox（输出栏）
-            comps[9].set_area(output_row[1]);  // RadioBox（输出模式）
-        } else if total >= 9 {
-            comps[8].set_area(chunks[5]);  // 只有输出栏时占满
+            comps[9].set_area(output_row[0]);  // OutputBox（输出栏）
+            comps[10].set_area(output_row[1]);  // RadioBox（输出模式）
+        } else if total >= 10 {
+            comps[9].set_area(chunks[5]);  // 只有输出栏时占满
         }
 
         // ── [6] 发送 / 清空 / 退出按钮 ──
-        if total >= 13 {
+        if total >= 14 {
             let btn_row = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -309,20 +367,23 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
                 ])
                 .split(chunks[6]);
 
-            comps[10].set_area(btn_row[0]);  // 发送按钮
-            comps[11].set_area(btn_row[1]);  // 清空按钮
-            comps[12].set_area(btn_row[2]);  // 退出按钮
+            comps[11].set_area(btn_row[0]);  // 发送按钮
+            comps[12].set_area(btn_row[1]);  // 清空按钮
+            comps[13].set_area(btn_row[2]);  // 退出按钮
         }
     }
 
-    // ── 渲染前同步：OutputBox (索引8) 从共享缓冲区拉取 pipe reader 写入的数据 ──
-    if total >= 9 {
-        if let Some(output_box) = comps[8].as_any_mut().downcast_mut::<OutputBox>() {
+    // ── 渲染前同步：OutputBox (索引9) 从共享缓冲区拉取 pipe reader 写入的数据 ──
+    if total >= 10 {
+        if let Some(output_box) = comps[9].as_any_mut().downcast_mut::<OutputBox>() {
             // 检查是否有清空请求（清空按钮通过 pipe::take_clear_request 设置）
             if crate::pipe::take_clear_request() {
                 output_box.clear();
+                // 清空时重置 PREV_RAW_LEN，避免清空后误判为新数据
+                PREV_RAW_LEN.store(0, Ordering::Relaxed);
             }
-            // 同步输出模式（必须在 sync_from_shared 之前设置，HEX 模式下跳过文本追加）
+
+            // 同步输出模式
             let mode = match OUTPUT_MODE.load(Ordering::Relaxed) {
                 0 => OutputMode::Ascii,
                 _ => OutputMode::Hex,
@@ -331,35 +392,31 @@ fn ui(f: &mut Frame, scheduler: &mut Scheduler) {
 
             // 检测输出模式是否切换
             let mode_switched = check_output_mode_switch();
+            // 检测是否有新数据到达（比较 raw buffer 长度变化）
+            let (has_new_data, _current_len) = detect_new_raw_data();
 
-            if mode == OutputMode::Hex {
-                // HEX 模式：基于原始字节缓冲区重建显示（每次渲染都重建，实时反映新数据）
+            // 统一策略：有新数据 或 模式切换时，基于 raw buffer 重建显示并滚动到底部
+            if has_new_data || mode_switched {
                 let raw_snapshot = crate::pipe::get_raw_output_snapshot();
                 output_box.rebuild_from_raw(&raw_snapshot);
-                // 仍需消耗共享缓冲区，避免内存泄漏（但不使用其结果）
-                output_box.drain_shared();
-            } else {
-                // ASCII 模式：追加共享行缓冲区中的文本行
-                output_box.sync_from_shared();
-                // 如果刚从 HEX 切回 ASCII，也需要重建
-                if mode_switched {
-                    let raw_snapshot = crate::pipe::get_raw_output_snapshot();
-                    output_box.rebuild_from_raw(&raw_snapshot);
-                }
+                output_box.scroll_to_bottom();
             }
+
+            // 始终消耗共享缓冲区，防止内存泄漏
+            output_box.drain_shared();
         }
     }
 
-    // ── 每帧检查 InputBox 错误消息是否过期 (索引7: InputBox) ──
-    if total >= 8 {
-        if let Some(input_box) = comps[7].as_any_mut().downcast_mut::<InputBox>() {
+    // ── 每帧检查 InputBox 错误消息是否过期 (索引8: InputBox) ──
+    if total >= 9 {
+        if let Some(input_box) = comps[8].as_any_mut().downcast_mut::<InputBox>() {
             input_box.take_error_message();
         }
     }
 
-    // ── 更新统计信息 (索引5: stats OutputBox) ──
-    if total >= 6 {
-        if let Some(stats_box) = comps[5].as_any_mut().downcast_mut::<OutputBox>() {
+    // ── 更新统计信息 (索引6: stats OutputBox) ──
+    if total >= 7 {
+        if let Some(stats_box) = comps[6].as_any_mut().downcast_mut::<OutputBox>() {
             let sent = crate::pipe::sent_bytes();
             let recv = crate::pipe::received_bytes();
             stats_box.clear();
